@@ -3,6 +3,12 @@ import sqlite3
 from datetime import datetime, date, timedelta
 from zoneinfo import ZoneInfo
 
+JST = ZoneInfo("Asia/Tokyo")
+
+def jst_today():
+    return datetime.now(JST).date()
+
+
 
 DB_PATH = "wakeups.db"
 
@@ -46,7 +52,7 @@ QUIZ_BANK = [
 ]
 
 def get_today_quiz():
-    today = date.today()
+    today = jst_today()
     key = today.year * 10000 + today.month * 100 + today.day
     idx = key % len(QUIZ_BANK)
     return QUIZ_BANK[idx]
@@ -207,7 +213,7 @@ def index():
 
 @app.route("/today")
 def today():
-    today_str = date.today().strftime("%Y-%m-%d")
+    today_str = jst_today().strftime("%Y-%m-%d")
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("SELECT name, ts FROM wakeups WHERE day = ? ORDER BY ts ASC", (today_str,))
@@ -218,7 +224,7 @@ def today():
 @app.route("/history")
 def history():
     N_DAYS_HISTORY = 7
-    end_date = date.today()
+    end_date = jst_today()
     start_date = end_date - timedelta(days=N_DAYS_HISTORY - 1)
 
     conn = sqlite3.connect(DB_PATH)
