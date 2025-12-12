@@ -1,6 +1,8 @@
 from flask import Flask, request, redirect, url_for, render_template_string
 import sqlite3
 from datetime import datetime, date, timedelta
+from zoneinfo import ZoneInfo
+
 
 DB_PATH = "wakeups.db"
 
@@ -188,7 +190,7 @@ def index():
                                           message="もう一度考えてみよう！")
 
         # 正解 → 記録
-        now = datetime.now()
+        now = datetime.now(ZoneInfo("Asia/Tokyo"))
         ts_str = now.strftime("%H:%M:%S")
         day_str = now.strftime("%Y-%m-%d")
         conn = sqlite3.connect(DB_PATH)
