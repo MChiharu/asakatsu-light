@@ -38,20 +38,82 @@ init_db()
 # 日替わり IT クイズ（基本情報“風”の自作問題）
 # ※ 過去問の本文をコピペすると著作権的に危ないので雰囲気寄せ
 # ------------------------
-QUIZ_BANK = [
-    {"question": "2進数 (1010)₂ を 10進数で表したものはどれ？",
-     "choices": ["8", "9", "10", "12"], "answer_index": 2},
-    {"question": "1バイトは何ビット？",
-     "choices": ["4ビット", "8ビット", "16ビット", "32ビット"], "answer_index": 1},
-    {"question": "OSの役割として適切なものはどれ？",
-     "choices": ["HWとアプリの仲立ち", "ネット接続だけ", "文字入力だけ", "ソース自動生成"], "answer_index": 0},
-    {"question": "LANの説明として最も適切なものはどれ？",
-     "choices": ["世界中のネットワーク", "狭い範囲のネットワーク", "電話網のみ", "無線のみ"], "answer_index": 1},
-    {"question": "情報セキュリティのCIAで C が意味するものはどれ？",
-     "choices": ["Confidence", "Control", "Confidentiality", "Connection"], "answer_index": 2},
-]
+from openpyxl import load_workbook
+
+QUIZ_XLSX_PATH = "quiz_database.xlsx"   # リポジトリ直下に置く想定
+QUIZ_SHEET_NAME = "quiz"               # テンプレ通り
+
+def load_quiz_bank_from_excel(path: str = QUIZ_XLSX_PATH, sheet_name: str = QUIZ_SHEET_NAME):
+    """
+    Excelから問題を読み込み、アプリ内部形式に変換する。
+    期待する列: id, question, choice1..choice4, answer(1-4), category, explanation
+    """
+    wb = load_workbook(path, data_only=True)
+    if sheet_name not in wb.sheetnames:
+        raise ValueError(f"Sheet '{sheet_name}' not found in {path}. Found: {wb.sheetnames}")
+
+    ws = wb[sheet_name]
+
+    # 1行目はヘッダ
+    headers = [str(c.value).strip() if c.value is not None else "" for c in next(ws.iter_rows(min_row=1, max_row=1))]
+    col = {h: i for i, h in enumerate(headers)}  # header -> index
+
+    required = ["id", "question", "choice1", "choice2", "choice3", "choice4", "answer"]
+    missing = [h for h in required if h not in col]
+    if missing:
+        raise ValueError(f"Missing required columns in Excel header: {missing}. Header={headers}")
+
+    quiz_bank = []
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        if row is None:
+            continue
+
+        q = row[col["question"]] if col["question"] < len(row) else None
+        if q is None or str(q).strip() == "":
+            continue  # question が空行はスキップ
+
+        choices = []
+        for k in ["choice1", "choice2", "choice3", "choice4"]:
+            v = row[col[k]] if col[k] < len(row) else ""
+            choices.append("" if v is None else str(v))
+
+        # answer は 1-4 を想定
+        ans_raw = row[col["answer"]] if col["answer"] < len(row) else None
+        try:
+            ans = int(str(ans_raw).strip())
+        except Exception:
+            continue
+        if ans < 1 or ans > 4:
+            continue
+
+        cat = ""
+        if "category" in col and col["category"] < len(row) and row[col["category"]] is not None:
+            cat = str(row[col["category"]]).strip()
+
+        exp = ""
+        if "explanation" in col and col["explanation"] < len(row) and row[col["explanation"]] is not None:
+            exp = str(row[col["explanation"]]).strip()
+
+        quiz_bank.append({
+            "question": str(q).strip(),
+            "choices": choices,
+            "answer_index": ans - 1,     # アプリ内は 0-3
+            "category": cat,
+            "explanation": exp,
+        })
+
+    if not quiz_bank:
+        raise ValueError("No valid quizzes loaded from Excel (all rows invalid or empty).")
+
+    return quiz_bank
+
+
+# 起動時に一度だけ読み込んでキャッシュ
+QUIZ_BANK = load_quiz_bank_from_excel()
+
 
 def get_today_quiz():
+    # JST基準の日付（あなたが前に直したのと同じ考え方）
     today = jst_today()
     key = today.year * 10000 + today.month * 100 + today.day
     idx = key % len(QUIZ_BANK)
