@@ -1,62 +1,49 @@
-from flask import Flask, request, redirect, url_for, render_template_string
-import sqlite3
-from datetime import datetime, date, timedelta
+import os
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-JST = ZoneInfo("Asia/Tokyo")
-
-def jst_today():
-    return datetime.now(JST).date()
-
-
-
-DB_PATH = "wakeups.db"
-
-app = Flask(__name__)
-
-# ------------------------
-# DB 初期化
-# ------------------------
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS wakeups (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            ts TEXT NOT NULL,
-            day TEXT NOT NULL
-        )
-    """)
-    conn.commit()
-    conn.close()
-
-# Flask 3 でも確実に動くように、起動時に一回だけ初期化
-init_db()
-
-# ------------------------
-# 日替わり IT クイズ（基本情報“風”の自作問題）
-# ※ 過去問の本文をコピペすると著作権的に危ないので雰囲気寄せ
-# ------------------------
+from flask import Flask, request, url_for, render_template_string
 from openpyxl import load_workbook
 
-QUIZ_XLSX_PATH = "quiz_database.xlsx"   # リポジトリ直下に置く想定
+import psycopg2
+
+
+# =========================
+# Timezone (JST)
+# =========================
+JST = ZoneInfo("Asia/Tokyo")
+
+def jst_now():
+    return datetime.now(JST)
+
+def jst_today():
+    return jst_now().date()
+
+
+# =========================
+# Quiz (Excel)
+# =========================
+QUIZ_XLSX_PATH = "quiz_database.xlsx"   # リポジトリ直下
 QUIZ_SHEET_NAME = "quiz"               # テンプレ通り
 
 def load_quiz_bank_from_excel(path: str = QUIZ_XLSX_PATH, sheet_name: str = QUIZ_SHEET_NAME):
     """
-    Excelから問題を読み込み、アプリ内部形式に変換する。
-    期待する列: id, question, choice1..choice4, answer(1-4), category, explanation
+    Excelから問題を読み込み、内部形式に変換する。
+    必須列: id, question, choice1, choice2, choice3, choice4, answer
+    任意列: category, explanation
+    answer は 1〜4（人間に優しい）を想定し、内部では 0〜3 に変換する。
     """
     wb = load_workbook(path, data_only=True)
+
     if sheet_name not in wb.sheetnames:
         raise ValueError(f"Sheet '{sheet_name}' not found in {path}. Found: {wb.sheetnames}")
 
     ws = wb[sheet_name]
 
-    # 1行目はヘッダ
-    headers = [str(c.value).strip() if c.value is not None else "" for c in next(ws.iter_rows(min_row=1, max_row=1))]
-    col = {h: i for i, h in enumerate(headers)}  # header -> index
+    # 1行目: ヘッダ
+    header_row = next(ws.iter_rows(min_row=1, max_row=1, values_only=True))
+    headers = [str(v).strip() if v is not None else "" for v in header_row]
+    col = {h: i for i, h in enumerate(headers)}
 
     required = ["id", "question", "choice1", "choice2", "choice3", "choice4", "answer"]
     missing = [h for h in required if h not in col]
@@ -65,25 +52,25 @@ def load_quiz_bank_from_excel(path: str = QUIZ_XLSX_PATH, sheet_name: str = QUIZ
 
     quiz_bank = []
     for row in ws.iter_rows(min_row=2, values_only=True):
-        if row is None:
+        if not row:
             continue
 
         q = row[col["question"]] if col["question"] < len(row) else None
         if q is None or str(q).strip() == "":
-            continue  # question が空行はスキップ
+            continue
 
         choices = []
-        for k in ["choice1", "choice2", "choice3", "choice4"]:
-            v = row[col[k]] if col[k] < len(row) else ""
+        for key in ["choice1", "choice2", "choice3", "choice4"]:
+            v = row[col[key]] if col[key] < len(row) else ""
             choices.append("" if v is None else str(v))
 
-        # answer は 1-4 を想定
         ans_raw = row[col["answer"]] if col["answer"] < len(row) else None
         try:
             ans = int(str(ans_raw).strip())
         except Exception:
             continue
-        if ans < 1 or ans > 4:
+
+        if not (1 <= ans <= 4):
             continue
 
         cat = ""
@@ -97,7 +84,7 @@ def load_quiz_bank_from_excel(path: str = QUIZ_XLSX_PATH, sheet_name: str = QUIZ
         quiz_bank.append({
             "question": str(q).strip(),
             "choices": choices,
-            "answer_index": ans - 1,     # アプリ内は 0-3
+            "answer_index": ans - 1,  # 0〜3
             "category": cat,
             "explanation": exp,
         })
@@ -108,26 +95,65 @@ def load_quiz_bank_from_excel(path: str = QUIZ_XLSX_PATH, sheet_name: str = QUIZ
     return quiz_bank
 
 
-# 起動時に一度だけ読み込んでキャッシュ
-QUIZ_BANK = load_quiz_bank_from_excel()
-
-
-def get_today_quiz():
-    # JST基準の日付（あなたが前に直したのと同じ考え方）
+def get_today_quiz(quiz_bank):
     today = jst_today()
     key = today.year * 10000 + today.month * 100 + today.day
-    idx = key % len(QUIZ_BANK)
-    return QUIZ_BANK[idx]
+    idx = key % len(quiz_bank)
+    return quiz_bank[idx]
 
-# ------------------------
-# HTML（全部 triple-quote で閉じてる完成形）
-# ------------------------
+
+# =========================
+# Database (PostgreSQL via Render)
+# =========================
+def get_db_conn():
+    url = os.environ.get("DATABASE_URL")
+    if not url:
+        raise RuntimeError("DATABASE_URL is not set (Render Environment Variables)")
+
+    # Render等で必要になることがあるのでSSL要求を付与
+    if "sslmode=" not in url:
+        joiner = "&" if "?" in url else "?"
+        url = url + f"{joiner}sslmode=require"
+
+    return psycopg2.connect(url)
+
+
+def init_db():
+    conn = get_db_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS wakeups (
+            id SERIAL PRIMARY KEY,
+            name TEXT NOT NULL,
+            ts TEXT NOT NULL,
+            day TEXT NOT NULL
+        );
+    """)
+    conn.commit()
+    cur.close()
+    conn.close()
+
+
+# =========================
+# Flask app
+# =========================
+app = Flask(__name__)
+
+# 起動時に一度だけ準備
+QUIZ_BANK = load_quiz_bank_from_excel()
+init_db()
+
+
+# =========================
+# HTML templates
+# =========================
 INDEX_HTML = """
 <!doctype html>
 <html>
   <head><meta charset="utf-8"><title>朝活ログイン</title></head>
   <body>
     <h1>朝活ログイン</h1>
+    <p style="color:gray;">（現在の問題数：{{ quiz_count }}問）</p>
     <p>内定者限定・日替わりITクイズでログイン 🤖</p>
 
     {% if error %}
@@ -139,7 +165,11 @@ INDEX_HTML = """
 
       <hr>
       <h2>今日のクイズ</h2>
+      {% if quiz_category %}
+        <p style="color:gray;">カテゴリ：{{ quiz_category }}</p>
+      {% endif %}
       <p>{{ quiz_question }}</p>
+
       {% for choice in quiz_choices %}
         <label>
           <input type="radio" name="choice" value="{{ loop.index0 }}">
@@ -166,6 +196,11 @@ RESULT_HTML = """
     <p>{{ message }}</p>
 
     {% if ok %}
+      {% if explanation %}
+        <hr>
+        <p><b>解説</b></p>
+        <p>{{ explanation }}</p>
+      {% endif %}
       <p><a href="{{ url_for('today') }}">今日のみんなの起床時間へ</a></p>
       <script>
         setTimeout(() => { window.location.href = "{{ url_for('today') }}"; }, 1200);
@@ -230,74 +265,130 @@ HISTORY_HTML = """
 </html>
 """
 
-# ------------------------
+
+# =========================
 # Routes
-# ------------------------
+# =========================
 @app.route("/", methods=["GET", "POST"])
 def index():
-    quiz = get_today_quiz()
+    quiz = get_today_quiz(QUIZ_BANK)
+
     if request.method == "POST":
         name = request.form.get("name", "").strip()
         choice_idx_str = request.form.get("choice")
 
         if not name:
-            return render_template_string(INDEX_HTML, error="名前を入力してください。",
-                                          quiz_question=quiz["question"], quiz_choices=quiz["choices"])
+            return render_template_string(
+                INDEX_HTML,
+                error="名前を入力してください。",
+                quiz_question=quiz["question"],
+                quiz_choices=quiz["choices"],
+                quiz_category=quiz.get("category", ""),
+                quiz_count=len(QUIZ_BANK),
+            )
+
         if choice_idx_str is None:
-            return render_template_string(INDEX_HTML, error="クイズの選択肢を選んでください。",
-                                          quiz_question=quiz["question"], quiz_choices=quiz["choices"])
+            return render_template_string(
+                INDEX_HTML,
+                error="クイズの選択肢を選んでください。",
+                quiz_question=quiz["question"],
+                quiz_choices=quiz["choices"],
+                quiz_category=quiz.get("category", ""),
+                quiz_count=len(QUIZ_BANK),
+            )
 
         try:
             choice_idx = int(choice_idx_str)
         except ValueError:
-            return render_template_string(INDEX_HTML, error="選択肢が不正です。",
-                                          quiz_question=quiz["question"], quiz_choices=quiz["choices"])
+            return render_template_string(
+                INDEX_HTML,
+                error="選択肢が不正です。",
+                quiz_question=quiz["question"],
+                quiz_choices=quiz["choices"],
+                quiz_category=quiz.get("category", ""),
+                quiz_count=len(QUIZ_BANK),
+            )
 
         if choice_idx != quiz["answer_index"]:
-            return render_template_string(RESULT_HTML, ok=False, title="❌ 不正解！",
-                                          message="もう一度考えてみよう！")
+            return render_template_string(
+                RESULT_HTML,
+                ok=False,
+                title="❌ 不正解！",
+                message="もう一度考えてみよう！",
+                explanation=None,
+            )
 
-        # 正解 → 記録
-        now = datetime.now(ZoneInfo("Asia/Tokyo"))
+        # 正解 → 起床時間を記録（JST）
+        now = jst_now()
         ts_str = now.strftime("%H:%M:%S")
         day_str = now.strftime("%Y-%m-%d")
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute("INSERT INTO wakeups (name, ts, day) VALUES (?, ?, ?)", (name, ts_str, day_str))
+
+        conn = get_db_conn()
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO wakeups (name, ts, day) VALUES (%s, %s, %s)",
+            (name, ts_str, day_str),
+        )
         conn.commit()
+        cur.close()
         conn.close()
 
-        return render_template_string(RESULT_HTML, ok=True, title="✅ ログイン成功！",
-                                      message=f"{name} さんの起床時間（{ts_str}）を記録しました。")
+        return render_template_string(
+            RESULT_HTML,
+            ok=True,
+            title="✅ ログイン成功！",
+            message=f"{name} さんの起床時間（{ts_str}）を記録しました。",
+            explanation=quiz.get("explanation") or None,
+        )
 
-    return render_template_string(INDEX_HTML, error=None,
-                                  quiz_question=quiz["question"], quiz_choices=quiz["choices"])
+    # GET
+    return render_template_string(
+        INDEX_HTML,
+        error=None,
+        quiz_question=quiz["question"],
+        quiz_choices=quiz["choices"],
+        quiz_category=quiz.get("category", ""),
+        quiz_count=len(QUIZ_BANK),
+    )
+
 
 @app.route("/today")
 def today():
     today_str = jst_today().strftime("%Y-%m-%d")
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT name, ts FROM wakeups WHERE day = ? ORDER BY ts ASC", (today_str,))
-    rows = c.fetchall()
+
+    conn = get_db_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT name, ts FROM wakeups WHERE day = %s ORDER BY ts ASC",
+        (today_str,),
+    )
+    rows = cur.fetchall()
+    cur.close()
     conn.close()
+
     return render_template_string(TODAY_HTML, today_str=today_str, rows=rows)
+
 
 @app.route("/history")
 def history():
-    N_DAYS_HISTORY = 7
+    N_DAYS_HISTORY = 30  # 好きに変更OK（例：30日表示）
+
     end_date = jst_today()
     start_date = end_date - timedelta(days=N_DAYS_HISTORY - 1)
 
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("""
+    start_str = start_date.strftime("%Y-%m-%d")
+    end_str = end_date.strftime("%Y-%m-%d")
+
+    conn = get_db_conn()
+    cur = conn.cursor()
+    cur.execute("""
         SELECT day, name, ts
         FROM wakeups
-        WHERE day BETWEEN ? AND ?
+        WHERE day BETWEEN %s AND %s
         ORDER BY day DESC, ts ASC
-    """, (start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d")))
-    rows = c.fetchall()
+    """, (start_str, end_str))
+    rows = cur.fetchall()
+    cur.close()
     conn.close()
 
     rows_by_day_dict = {}
@@ -306,11 +397,26 @@ def history():
 
     rows_by_day = sorted(rows_by_day_dict.items(), key=lambda x: x[0], reverse=True)
 
-    return render_template_string(HISTORY_HTML,
-                                  rows_by_day=rows_by_day,
-                                  start_str=start_date.strftime("%Y-%m-%d"),
-                                  end_str=end_date.strftime("%Y-%m-%d"))
+    return render_template_string(
+        HISTORY_HTML,
+        rows_by_day=rows_by_day,
+        start_str=start_str,
+        end_str=end_str,
+    )
+
+
+# （確認用：必要なときだけ使って、動いたら消してOK）
+@app.route("/admin/dbinfo")
+def admin_dbinfo():
+    conn = get_db_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*), MIN(day), MAX(day) FROM wakeups")
+    count, minday, maxday = cur.fetchone()
+    cur.close()
+    conn.close()
+    return {"count": count, "min_day": minday, "max_day": maxday}
+
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000)
-
+    # ローカル起動用。Renderではgunicornが起動するのでここは使われません
+    app.run(host="0.0.0.0", port=5000, debug=True)
