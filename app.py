@@ -470,9 +470,12 @@ def download_wakeups_csv():
     csv_text = output.getvalue()
     output.close()
 
+    # ★ここがポイント：Excel向けにUTF-8 BOM付きで返す
+    csv_bytes = csv_text.encode("utf-8-sig")  # BOM付きUTF-8
+
     filename = f"wakeups_{start_str}_to_{end_str}.csv"
     return Response(
-        csv_text,
+        csv_bytes,
         mimetype="text/csv; charset=utf-8",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'}
     )
