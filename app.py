@@ -195,6 +195,153 @@ def seed_titles():
     cur.close()
     conn.close()
 
+def get_user_login_days(user_name: str, limit: int = 60):
+    """
+    指定ユーザーのログイン日（day）を新しい順で返す。
+    同一日の複数ログインは1日として扱う（DISTINCT）。
+    """
+    conn = get_db_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT DISTINCT day
+        FROM wakeups
+        WHERE name = %s
+        ORDER BY day DESC
+        LIMIT %s
+    """, (user_name, limit))
+    days = [r[0] for r in cur.fetchall()]
+    cur.close()
+    conn.close()
+    return days
+
+
+def calc_streak_days(days_desc: list[str]) -> int:
+    """
+    days_desc: ["2026-01-15", "2026-01-14", ...] のような降順
+    連続日数を計算して返す（今日から途切れるまで）
+    """
+    if not days_desc:
+        return 0
+
+    streak = 1
+    prev = datetime.strptime(days_desc[0], "%Y-%m-%d").date()
+    for d in days_desc[1:]:
+        cur = datetime.strptime(d, "%Y-%m-%d").date()
+        if prev - cur == timedelta(days=1):
+            streak += 1
+            prev = cur
+        else:
+            break
+    return streak
+
+
+def grant_title_if_not_owned(user_name: str, title_code: str, acquired_day: str):
+    """
+    既に持っていたら何もしない。持っていなければ付与する。
+    """
+    conn = get_db_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO user_titles (user_name, title_code, acquired_day)
+        VALUES (%s, %s, %s)
+        ON CONFLICT (user_name, title_code) DO NOTHING
+    """, (user_name, title_code, acquired_day))
+    conn.commit()
+    cur.close()
+    conn.close()
+
+
+def evaluate_and_grant_streak_titles(user_name: str, today_str: str):
+    """
+    連続ログイン称号（3/7/14）を判定して付与する。
+    """
+    days_desc = get_user_login_days(user_name, limit=60)
+    streak = calc_streak_days(days_desc)
+
+    if streak >= 3:
+        grant_title_if_not_owned(user_name, "streak_3", today_str)
+    if streak >= 7:
+        grant_title_if_not_owned(user_name, "streak_7", today_str)
+    if streak >= 14:
+        grant_title_if_not_owned(user_name, "streak_14", today_str)
+
+    return streak
+
+
+def fetch_titles_with_holders():
+    """
+    称号一覧（titles）と保持者一覧（user_titles）を結合して返す。
+    隠し称号は、保持者がいる場合のみ表示する。
+    """
+    conn = get_db_conn()
+    cur = conn.cursor()
+
+    # titles と user_titles を左結合して保持者をまとめる
+    cur.execute("""
+        SELECT
+            t.code, t.name, t.description, t.is_hidden,
+            ut.user_name
+        FROM titles t
+        LEFT JOIN user_titles ut
+          ON t.code = ut.title_code
+        ORDER BY t.id ASC, ut.user_name ASC
+    """)
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+
+    # 整形
+    titles = {}
+    for code, name, desc, is_hidden, user_name in rows:
+        if code not in titles:
+            titles[code] = {
+                "code": code,
+                "name": name,
+                "description": desc,
+                "is_hidden": bool(is_hidden),
+                "holders": []
+            }
+        if user_name:
+            titles[code]["holders"].append(user_name)
+
+    # 隠し称号は保持者がいないなら表示しない
+    result = []
+    for t in titles.values():
+        if t["is_hidden"] and len(t["holders"]) == 0:
+            continue
+        result.append(t)
+
+    return result
+
+
+def fetch_user_titles(user_name: str):
+    """
+    特定ユーザーが持っている称号を返す（称号マスタ付き）
+    """
+    conn = get_db_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT t.code, t.name, t.description, t.is_hidden, ut.acquired_day
+        FROM user_titles ut
+        JOIN titles t
+          ON ut.title_code = t.code
+        WHERE ut.user_name = %s
+        ORDER BY ut.acquired_day DESC, t.id ASC
+    """, (user_name,))
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+
+    return [
+        {
+            "code": r[0],
+            "name": r[1],
+            "description": r[2],
+            "is_hidden": bool(r[3]),
+            "acquired_day": r[4],
+        }
+        for r in rows
+    ]
 
 
 
@@ -400,14 +547,16 @@ def index():
         conn.commit()
         cur.close()
         conn.close()
+        streak = evaluate_and_grant_streak_titles(name, day_str)
+
 
         return render_template_string(
             RESULT_HTML,
             ok=True,
             title="✅ ログイン成功！",
-            message=f"{name} さんの起床時間（{ts_str}）を記録しました。",
+            message=f"{name} さんの起床時間（{ts_str}）を記録しました。連続ログイン：{streak}日",
             explanation=quiz.get("explanation") or None,
-        )
+            )
 
     # GET
     return render_template_string(
@@ -554,3 +703,28 @@ def admin_titles():
     cur.close()
     conn.close()
     return {"titles": rows}
+
+@app.route("/admin/user_titles")
+def admin_user_titles():
+    user = request.args.get("user")
+    conn = get_db_conn()
+    cur = conn.cursor()
+    if user:
+        cur.execute("""
+            SELECT user_name, title_code, acquired_day
+            FROM user_titles
+            WHERE user_name = %s
+            ORDER BY acquired_day DESC
+        """, (user,))
+    else:
+        cur.execute("""
+            SELECT user_name, title_code, acquired_day
+            FROM user_titles
+            ORDER BY acquired_day DESC
+            LIMIT 200
+        """)
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return {"user_titles": rows}
+
