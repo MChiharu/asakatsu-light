@@ -10,6 +10,9 @@ import io
 import csv
 from flask import Response
 
+from datetime import datetime, timedelta
+from datetime import time
+
 
 # =========================
 # Timezone (JST)
@@ -343,6 +346,184 @@ def fetch_user_titles(user_name: str):
         for r in rows
     ]
 
+def _parse_time(ts_str: str):
+    # "HH:MM:SS" 想定。 "HH:MM" しか無い場合も救う
+    parts = ts_str.split(":")
+    if len(parts) == 2:
+        h, m = int(parts[0]), int(parts[1])
+        s = 0
+    else:
+        h, m, s = int(parts[0]), int(parts[1]), int(parts[2])
+    return time(h, m, s)
+
+
+def get_user_wakeups(user_name: str, limit: int = 60):
+    """
+    ユーザーの起床ログを新しい順で返す（同一日複数回は最初の1件だけにする）
+    返り値: [{"day": "...", "ts": "..."} ...] (降順)
+    """
+    conn = get_db_conn()
+    cur = conn.cursor()
+    # 同一日の中で最小tsを採用（＝一番早いログインをその日の起床とみなす）
+    cur.execute("""
+        SELECT day, MIN(ts) as ts
+        FROM wakeups
+        WHERE name = %s
+        GROUP BY day
+        ORDER BY day DESC
+        LIMIT %s
+    """, (user_name, limit))
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return [{"day": r[0], "ts": r[1]} for r in rows]
+
+
+def is_consecutive_days(days_desc: list[str], need: int) -> bool:
+    """
+    days_desc は降順。先頭から need 日が連続しているか。
+    """
+    if len(days_desc) < need:
+        return False
+    prev = datetime.strptime(days_desc[0], "%Y-%m-%d").date()
+    for i in range(1, need):
+        cur = datetime.strptime(days_desc[i], "%Y-%m-%d").date()
+        if prev - cur != timedelta(days=1):
+            return False
+        prev = cur
+    return True
+
+
+def evaluate_and_grant_regular_3(user_name: str, today_str: str):
+    """
+    規則正しい生活：前日±30分以内の起床が3日連続
+    条件を判定し、満たせば regular_3 を付与
+    """
+    logs = get_user_wakeups(user_name, limit=10)
+    if len(logs) < 3:
+        return False
+
+    # 連続3日でなければ不成立
+    days_desc = [x["day"] for x in logs]
+    if not is_consecutive_days(days_desc, 3):
+        return False
+
+    # 時刻差を分で評価（前日との差が±30分以内が2回続けばOK）
+    def minutes(t: time) -> int:
+        return t.hour * 60 + t.minute  # 秒は丸め
+
+    t0 = minutes(_parse_time(logs[0]["ts"]))  # 今日
+    t1 = minutes(_parse_time(logs[1]["ts"]))  # 昨日
+    t2 = minutes(_parse_time(logs[2]["ts"]))  # 一昨日
+
+    ok01 = abs(t0 - t1) <= 30
+    ok12 = abs(t1 - t2) <= 30
+
+    if ok01 and ok12:
+        grant_title_if_not_owned(user_name, "regular_3", today_str)
+        return True
+    return False
+
+
+def evaluate_and_grant_noon_3(user_name: str, today_str: str):
+    """
+    昼夜逆転：12:00以降の起床が3日連続
+    """
+    logs = get_user_wakeups(user_name, limit=10)
+    if len(logs) < 3:
+        return False
+    days_desc = [x["day"] for x in logs]
+    if not is_consecutive_days(days_desc, 3):
+        return False
+
+    def is_noon(ts: str) -> bool:
+        t = _parse_time(ts)
+        return (t.hour >= 12)
+
+    if all(is_noon(x["ts"]) for x in logs[:3]):
+        grant_title_if_not_owned(user_name, "noon_3", today_str)
+        return True
+    return False
+
+
+def evaluate_and_grant_no_sleep_3(user_name: str, today_str: str):
+    """
+    もしかして寝てない？：04:00以前の起床が3日連続
+    """
+    logs = get_user_wakeups(user_name, limit=10)
+    if len(logs) < 3:
+        return False
+    days_desc = [x["day"] for x in logs]
+    if not is_consecutive_days(days_desc, 3):
+        return False
+
+    def is_too_early(ts: str) -> bool:
+        t = _parse_time(ts)
+        # 04:00:00 以前
+        return (t.hour < 4) or (t.hour == 4 and t.minute == 0 and t.second == 0)
+
+    if all(is_too_early(x["ts"]) for x in logs[:3]):
+        grant_title_if_not_owned(user_name, "no_sleep_3", today_str)
+        return True
+    return False
+
+
+def evaluate_and_grant_earlyking_3(today_str: str):
+    """
+    早起き王：その日の最速起床者を3日連続で取った人に付与
+    今日ログインした人だけで判定し、必要なら付与する。
+    """
+    # 直近3日分（today, yesterday, day-2）の最速者を取る
+    today = datetime.strptime(today_str, "%Y-%m-%d").date()
+    days = [(today - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(3)]
+
+    conn = get_db_conn()
+    cur = conn.cursor()
+
+    winners = []
+    for d in days:
+        # その日の最速(tsが最小)の name を取る（同点は名前順で1人）
+        cur.execute("""
+            SELECT name, MIN(ts) as ts
+            FROM wakeups
+            WHERE day = %s
+            GROUP BY name
+            ORDER BY ts ASC, name ASC
+            LIMIT 1
+        """, (d,))
+        row = cur.fetchone()
+        if not row:
+            winners.append(None)
+        else:
+            winners.append(row[0])
+
+    cur.close()
+    conn.close()
+
+    # 3日全部データが揃っていて、同じ人なら付与
+    if all(winners) and winners[0] == winners[1] == winners[2]:
+        grant_title_if_not_owned(winners[0], "earlyking_3", today_str)
+        return winners[0]
+    return None
+
+
+def evaluate_and_grant_all_titles(user_name: str, today_str: str):
+    """
+    ログイン時に呼ぶ統合関数
+    """
+    streak = evaluate_and_grant_streak_titles(user_name, today_str)
+    regular_ok = evaluate_and_grant_regular_3(user_name, today_str)
+    noon_ok = evaluate_and_grant_noon_3(user_name, today_str)
+    nosleep_ok = evaluate_and_grant_no_sleep_3(user_name, today_str)
+    earlyking_user = evaluate_and_grant_earlyking_3(today_str)
+
+    return {
+        "streak": streak,
+        "regular_ok": regular_ok,
+        "noon_ok": noon_ok,
+        "nosleep_ok": nosleep_ok,
+        "earlyking_user": earlyking_user,
+    }
 
 
 # =========================
@@ -613,16 +794,31 @@ def index():
         conn.commit()
         cur.close()
         conn.close()
-        streak = evaluate_and_grant_streak_titles(name, day_str)
+        
+        award = evaluate_and_grant_all_titles(name, day_str)
+        streak = award["streak"]
+
+        new_msgs = []
+        if award["regular_ok"]:
+            new_msgs.append("🏅 規則正しい生活 を獲得！")
+        if award["noon_ok"]:
+            new_msgs.append("🕵 隠し称号：昼夜逆転 を獲得！")
+        if award["nosleep_ok"]:
+            new_msgs.append("🕵 隠し称号：もしかして寝てない？ を獲得！")
+        if award["earlyking_user"] == name:
+            new_msgs.append("🕵 隠し称号：早起き王 を獲得！")
+
+        extra = ("<br>" + "<br>".join(new_msgs)) if new_msgs else ""
 
 
         return render_template_string(
             RESULT_HTML,
             ok=True,
             title="✅ ログイン成功！",
-            message=f"{name} さんの起床時間（{ts_str}）を記録しました。連続ログイン：{streak}日",
+            message=f"{name} さんの起床時間（{ts_str}）を記録しました。連続ログイン：{streak}日{extra}",
             explanation=quiz.get("explanation") or None,
             )
+
 
     # GET
     return render_template_string(
