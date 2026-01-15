@@ -6,6 +6,9 @@ from flask import Flask, request, url_for, render_template_string
 from openpyxl import load_workbook
 
 import psycopg2
+import io
+import csv
+from flask import Response
 
 
 # =========================
@@ -420,3 +423,56 @@ def admin_dbinfo():
 if __name__ == "__main__":
     # ローカル起動用。Renderではgunicornが起動するのでここは使われません
     app.run(host="0.0.0.0", port=5000, debug=True)
+
+@app.route("/download/wakeups.csv")
+def download_wakeups_csv():
+    # クエリパラメータ（任意）
+    # 1) days=30 なら直近30日
+    # 2) start=YYYY-MM-DD&end=YYYY-MM-DD ならその範囲
+    days = request.args.get("days", default=None, type=int)
+    start = request.args.get("start", default=None, type=str)
+    end = request.args.get("end", default=None, type=str)
+
+    # 期間の決定（JST基準）
+    end_date = jst_today()
+    if days:
+        start_date = end_date - timedelta(days=max(1, days) - 1)
+        start_str = start_date.strftime("%Y-%m-%d")
+        end_str = end_date.strftime("%Y-%m-%d")
+    elif start and end:
+        # 形式チェックは最低限（厳密にしたければ後で追加）
+        start_str, end_str = start.strip(), end.strip()
+    else:
+        # デフォルト：直近30日
+        start_date = end_date - timedelta(days=29)
+        start_str = start_date.strftime("%Y-%m-%d")
+        end_str = end_date.strftime("%Y-%m-%d")
+
+    # DBから取得
+    conn = get_db_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT day, ts, name
+        FROM wakeups
+        WHERE day BETWEEN %s AND %s
+        ORDER BY day ASC, ts ASC
+    """, (start_str, end_str))
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+
+    # CSV生成（メモリ上）
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["day", "ts", "name"])
+    writer.writerows(rows)
+
+    csv_text = output.getvalue()
+    output.close()
+
+    filename = f"wakeups_{start_str}_to_{end_str}.csv"
+    return Response(
+        csv_text,
+        mimetype="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+    )
