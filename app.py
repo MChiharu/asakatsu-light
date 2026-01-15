@@ -398,6 +398,7 @@ INDEX_HTML = """
     <hr>
     <p><a href="{{ url_for('today') }}">今日のみんなの起床時間を見る</a></p>
     <p><a href="{{ url_for('history') }}">起床履歴（ヒストリー）を見る</a></p>
+    <p><a href="{{ url_for('titles_page') }}">称号を見る</a></p>
   </body>
 </html>
 """
@@ -476,6 +477,71 @@ HISTORY_HTML = """
     <hr>
     <p><a href="{{ url_for('index') }}">ログインページに戻る</a></p>
     <p><a href="{{ url_for('today') }}">今日の起床時間を見る</a></p>
+  </body>
+</html>
+"""
+
+TITLES_HTML = """
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>称号</title>
+  </head>
+  <body>
+    <h1>🏅 称号</h1>
+
+    <form method="get" action="{{ url_for('titles_page') }}">
+      <label>名前で検索：</label>
+      <input type="text" name="user" value="{{ user_query or '' }}" placeholder="例：ちはる">
+      <button type="submit">検索</button>
+      {% if user_query %}
+        <a href="{{ url_for('titles_page') }}">（クリア）</a>
+      {% endif %}
+    </form>
+
+    <hr>
+
+    {% if user_query %}
+      <h2>「{{ user_query }}」の称号</h2>
+      {% if user_titles %}
+        <ul>
+          {% for t in user_titles %}
+            <li>
+              <b>{{ t.name }}</b>
+              （{{ t.acquired_day }}）
+              <br>
+              <span style="color:gray;">{{ t.description }}</span>
+            </li>
+          {% endfor %}
+        </ul>
+      {% else %}
+        <p>まだ称号がありません。</p>
+      {% endif %}
+
+      <hr>
+      <h2>称号一覧（保持者）</h2>
+    {% endif %}
+
+    {% for t in titles %}
+      <div style="margin-bottom: 18px;">
+        <h3>🏷 {{ t.name }}</h3>
+        <p style="margin-top:-8px; color:gray;">{{ t.description }}</p>
+
+        {% if t.holders %}
+          <p><b>保持者：</b>
+            {{ t.holders | join(", ") }}
+          </p>
+        {% else %}
+          <p style="color:gray;">保持者：まだいません</p>
+        {% endif %}
+      </div>
+      <hr>
+    {% endfor %}
+
+    <p><a href="{{ url_for('index') }}">ログインページへ</a></p>
+    <p><a href="{{ url_for('today') }}">今日の起床時間へ</a></p>
+    <p><a href="{{ url_for('history') }}">履歴へ</a></p>
   </body>
 </html>
 """
@@ -728,3 +794,20 @@ def admin_user_titles():
     conn.close()
     return {"user_titles": rows}
 
+@app.route("/titles")
+def titles_page():
+    user = request.args.get("user", default=None, type=str)
+    user_query = user.strip() if user else ""
+
+    titles = fetch_titles_with_holders()
+
+    user_titles = None
+    if user_query:
+        user_titles = fetch_user_titles(user_query)
+
+    return render_template_string(
+        TITLES_HTML,
+        titles=titles,
+        user_query=user_query,
+        user_titles=user_titles,
+    )
