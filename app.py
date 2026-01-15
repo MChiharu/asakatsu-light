@@ -124,6 +124,8 @@ def get_db_conn():
 def init_db():
     conn = get_db_conn()
     cur = conn.cursor()
+
+    # 起床ログ（既存）
     cur.execute("""
         CREATE TABLE IF NOT EXISTS wakeups (
             id SERIAL PRIMARY KEY,
@@ -132,9 +134,68 @@ def init_db():
             day TEXT NOT NULL
         );
     """)
+
+    # 称号マスタ
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS titles (
+            id SERIAL PRIMARY KEY,
+            code TEXT UNIQUE NOT NULL,
+            name TEXT NOT NULL,
+            description TEXT NOT NULL,
+            is_hidden BOOLEAN NOT NULL DEFAULT FALSE
+        );
+    """)
+
+    # ユーザー称号（獲得履歴）
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS user_titles (
+            id SERIAL PRIMARY KEY,
+            user_name TEXT NOT NULL,
+            title_code TEXT NOT NULL,
+            acquired_day TEXT NOT NULL,
+            UNIQUE(user_name, title_code)
+        );
+    """)
+
     conn.commit()
     cur.close()
     conn.close()
+
+def seed_titles():
+    titles = [
+        # 連続ログイン
+        ("streak_3", "3日坊主卒業", "3日連続でログインした", False),
+        ("streak_7", "習慣化マスター", "7日連続でログインした", False),
+        ("streak_14", "朝活職人", "14日連続でログインした", False),
+
+        # 規則正しい生活
+        ("regular_3", "規則正しい生活", "前日の起床時刻±30分以内を3日連続で達成した", False),
+
+        # 隠し称号（今は登録だけ。判定は後で）
+        ("noon_3", "昼夜逆転", "12:00以降の起床を3日以上達成した", True),
+        ("earlyking_3", "早起き王", "最速起床を3日連続で達成した", True),
+        ("no_sleep_3", "もしかして寝てない？", "04:00以前の起床を3日以上達成した", True),
+    ]
+
+    conn = get_db_conn()
+    cur = conn.cursor()
+
+    # 既に同じcodeがあれば何もしない（upsert）
+    for code, name, desc, hidden in titles:
+        cur.execute("""
+            INSERT INTO titles (code, name, description, is_hidden)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (code) DO UPDATE
+            SET name = EXCLUDED.name,
+                description = EXCLUDED.description,
+                is_hidden = EXCLUDED.is_hidden;
+        """, (code, name, desc, hidden))
+
+    conn.commit()
+    cur.close()
+    conn.close()
+
+
 
 
 # =========================
@@ -144,7 +205,11 @@ app = Flask(__name__)
 
 # 起動時に一度だけ準備
 QUIZ_BANK = load_quiz_bank_from_excel()
-init_db()
+try:
+    init_db()
+    seed_titles()
+except Exception as e:
+    print("DB init/seed failed:", repr(e))
 
 
 # =========================
@@ -479,3 +544,13 @@ def download_wakeups_csv():
         mimetype="text/csv; charset=utf-8",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'}
     )
+
+@app.route("/admin/titles")
+def admin_titles():
+    conn = get_db_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT code, name, is_hidden FROM titles ORDER BY id;")
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return {"titles": rows}
